@@ -1,100 +1,170 @@
 /*
-  WiFi TCP Client
-  TCP Socket client for WiFiNINA and WiFi101 libraries.
-  Connects to the TCP socket server, reads a sensor once
-  every five seconds, and sends a message with the reading.
+  MQTT Client sender/receiver
 
-  You'll need to include an arduino_secrets.h file with the following info:
-  #define SECRET_SSID "ssid"      // your network name
-  #define SECRET_PASS "password"  // your network password
+  This sketch demonstrates an MQTT client that connects to a broker, subscribes to a topic,
+  and both listens for messages on that topic and sends messages to it, a random number between 0 and 255.
+  When the client receives a message, it parses it, and PWMs the built-in LED.
 
-  Here's a test with netcat: 
-  char serverAddress[] = "x.x.x.x";  // replace with your computer's IP
-  then on your computer, run netcat:
-  $ nc -klw 2 8080 | tee log.json
-  This will send the output to the command line and to a file called log.json
+  This sketch uses https://public.cloud.shiftr.io as the MQTT broker, but others will work as well.
+  See https://tigoe.github.io/mqtt-examples/#broker-client-settings for connection details. 
 
-  created 30 Dec 2022
-  updated 27 Jan 2025
+Libraries used:
+  * http://librarymanager/All#WiFiNINA or
+  * http://librarymanager/All#WiFi101 
+  * http://librarymanager/All#WiFiS3 
+  * http://librarymanager/All#ArduinoMqttClient
+
+  the arduino_secrets.h file:
+  #define SECRET_SSID ""    // network name
+  #define SECRET_PASS ""    // network password
+  #define SECRET_MQTT_USER "public" // broker username
+  #define SECRET_MQTT_PASS "public" // broker password
+
+  created 11 June 2020
+  updated 25 Feb 2025
   by Tom Igoe
- */
+*/
 
-// #include <WiFi101.h>   // use this for MKR1000 board
-#include <WiFiNINA.h>  // use this for Nano 33 IoT or MKR1010 boards
-// #include <WiFi.h>  // use this for Nano ESP32 board
+#include <WiFiNINA.h>  // use this for Nano 33 IoT, MKR1010, Uno WiFi
+// #include <WiFi101.h>    // use this for MKR1000
+// #include <WiFiS3.h>  // use this for Uno R4 WiFi
+// #include <ESP8266WiFi.h>  // use this for ESP8266-based boards
+#include <ArduinoMqttClient.h>
 #include "arduino_secrets.h"
 
-// Initialize the Wifi client library
-WiFiClient client;
+#define VIBRATION_SENSOR_PIN 2
 
-// replace with your host computer's IP address
-const char server[] = "10.18.250.191";
-const int portNum = 8080;
-// change this to a unique name for the device:
-String deviceName = "ping-pong-watch";
-// message sending interval, in ms:
-int interval = 5000;
-// last time a message was sent, in ms:
-long lastSend = 0;
+// initialize WiFi connection. If the broker is using
+// encrypted mqtts, use SSL like so:
+// WiFiSSLClient wifi;
+// if the broker is not using mqtts, connect without SSL like so:
+WiFiClient wifi;
+MqttClient mqttClient(wifi);
+
+// details for MQTT client:
+char broker[] = "tigoe.net";
+int port = 1883;
+char topic[] = "jim_pingpong";
+String clientID = "mqttx_e5080133";
+
+// last time the client sent a message, in ms:
+long lastTimeSent = 0;
+// message sending interval:
+int interval = 500;
 
 void setup() {
-  //Initialize serial
+  // initialize serial:
   Serial.begin(9600);
-  // if serial monitor's not open, wait 3 seconds:
+  // wait for serial monitor to open:
   if (!Serial) delay(3000);
-
-  // Connect to WPA/WPA2 network.
-  WiFi.begin(SECRET_SSID, SECRET_PASS);
-
-  // attempt to connect to Wifi network:
-  while (WiFi.status() != WL_CONNECTED) {
-    Serial.print("Attempting to connect to SSID: ");
-    Serial.println(SECRET_SSID);
-    // wait a second for connection:
-    delay(1000);
+  pinMode(LED_BUILTIN, OUTPUT);
+  // connect to WiFi:
+  connectToNetwork();
+  // make the clientID unique by adding the last three digits of the MAC address:
+  byte mac[6];
+  WiFi.macAddress(mac);
+  for (int i = 0; i < 3; i++) {
+    clientID += String(mac[i], HEX);
   }
-  Serial.print("Connected to to SSID: ");
-  Serial.println(SECRET_SSID);
-  Serial.print("IP: ");
-  Serial.println(WiFi.localIP());
-  Serial.print("Signal Strength (dBm): ");
-  Serial.println(WiFi.RSSI());
+  // set the credentials for the MQTT client:
+  mqttClient.setId(clientID);
+  // if needed, login to the broker with a username and password:
+  mqttClient.setUsernamePassword(SECRET_MQTT_USER, SECRET_MQTT_PASS);
 }
 
 void loop() {
-  // if the client's not connected, connect:
-  if (!client.connected()) {
-    Serial.println("connecting");
-    Serial.println(server);
-    Serial.println(portNum);
-    client.connect(server, portNum);
-    // skip the rest of the loop:
+  // if you disconnected from the network, reconnect:
+  if (WiFi.status() != WL_CONNECTED) {
+    connectToNetwork();
+    // skip the rest of the loop until you are connected:
     return;
   }
 
-  // once every interval, get a reading and send it:
-  if (millis() - lastSend > interval) {
-    // read sensor:
-    int sensor = analogRead(A0);
-    // format the message as JSON string:
-    String message = "{\"device\": \"DEVICE\", \"sensor\": READING, \"millis\": MILLIS}";
-    // replace READING with the reading:
-    message.replace("READING", String(sensor));
-    // and DEVICE with your device's name:
-    message.replace("DEVICE", deviceName);
+  // if not connected to the broker, try to connect:
+  if (!mqttClient.connected()) {
+    Serial.println("attempting to connect to broker");
+    connectToBroker();
+  }
+  // poll for new messages from the broker:
+  // mqttClient.poll();
 
-    message.replace("MILLIS", String(millis()));
-    // send the message:
-    client.println(message);
-    // update the timestamp:
-    lastSend = millis();
+  // once every interval, send a message:
+  if (millis() - lastTimeSent > interval) {
+    int sensorReading = digitalRead(VIBRATION_SENSOR_PIN);
+    if (sensorReading != LOW) return;
+    if (mqttClient.connected()) {
+      // start a new message on the topic:
+      mqttClient.beginMessage(topic);
+      // print the body of the message:
+      mqttClient.print(sensorReading);
+      // send the message:
+      mqttClient.endMessage();
+      // send a serial notification:
+      Serial.print("published a message: ");
+      Serial.println(sensorReading);
+      // timestamp this message:
+      lastTimeSent = millis();
+    }
+  }
+}
+
+boolean connectToBroker() {
+  // if the MQTT client is not connected:
+  if (!mqttClient.connect(broker, port)) {
+    // print out the error message:
+    Serial.print("MOTT connection failed. Error no: ");
+    Serial.println(mqttClient.connectError());
+    // return that you're not connected:
+    return false;
   }
 
-  // check if there is incoming data available to be received
-  int messageSize = client.available();
-  // if there's a string with length > 0:
-  if (messageSize > 0) {
-    Serial.println("Received a message:");
-    Serial.println(client.readString());
+  // set the message receive callback:
+  mqttClient.onMessage(onMqttMessage);
+  // subscribe to a topic:
+  Serial.print("Subscribing to topic: ");
+  Serial.println(topic);
+  mqttClient.subscribe(topic);
+
+  // once you're connected, you
+  // return that you're connected:
+  return true;
+}
+
+void onMqttMessage(int messageSize) {
+  // we received a message, print out the topic and contents
+  Serial.println("Received a message with topic ");
+  Serial.print(mqttClient.messageTopic());
+  Serial.print(", length ");
+  Serial.print(messageSize);
+  Serial.println(" bytes:");
+  String incoming = "";
+  // use the Stream interface to print the contents
+  while (mqttClient.available()) {
+    incoming += (char)mqttClient.read();
   }
+  // convert the incoming string to an int so you can use it:
+  int result = incoming.toInt();
+  // use the result to dim the builtin LED:
+  if (result > 0) {
+    analogWrite(LED_BUILTIN, result);
+  }
+  // print the result:
+  Serial.println(result);
+  delay(100);
+}
+
+void connectToNetwork() {
+  // try to connect to the network:
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Attempting to connect to: " + String(SECRET_SSID));
+    //Connect to WPA / WPA2 network:
+    WiFi.begin(SECRET_SSID, SECRET_PASS);
+    delay(2000);
+  }
+
+  // print IP address once connected:
+  Serial.print("Connected. My IP address: ");
+  Serial.println(WiFi.localIP());
+
+  digitalWrite(LED_BUILTIN, HIGH);
 }
